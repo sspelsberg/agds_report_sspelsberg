@@ -15,7 +15,7 @@ classes from MODIS data, based on the land cover classification model
 implemented by Hufken (2023) in *A Handful of Pixels*. As training and
 test data set, we will use the data sets provided there. Original
 validation data stems from Fritz et al. (2017) and can be downloaded via
-Zenodo. As predictor data we use MODIS data from the MCD43A4 data
+Zenodo. The predictor data stems originally from the MCD43A4 MODIS data
 product (bands 1-7). This can be downloaded with the NASA AppEEARS API
 via the {appears} package.
 
@@ -24,7 +24,7 @@ to the original model. The implementation in *A Handful of Pixels* is a
 simplified version of the official MODIS land use and land cover (LULC)
 product (MCD12Q1 LULC), which shows a much better model performance than
 the simplified version (Friedl et al. 2010). Therefore, some
-improvements can be derived from their implementation of the model.
+improvements can be derived from the Friedl et al. implementation of the model.
 
 1)  **tune more hyper-parameters:** this can increase the model
     performance significantly, but comes at higher computational costs.
@@ -60,8 +60,7 @@ improvements can be derived from their implementation of the model.
 In the following, I will implement the first three ideas: I will tune
 more hyper-parameters, increase the number of trees and I will use
 monthly instead of daily predictor data and include annual mean, minimum
-and maximum values. Thus, I will add parts to the model training
-workflow as well as an additional step to the data wrangling.
+and maximum values. Thus, I will add an additional step to the data wrangling and I will modify the model training workflow.
 
 ```{r libraries, include = FALSE}
 use_pkgs <-  c("dplyr", "tidyr", "readr", "lubridate", "stringr", "purrr",
@@ -99,41 +98,38 @@ test <- readRDS("../data/test_data.rds")
 ```
 
 To do so, it is important to understand the structure of the data. It
-comes in a wide format, so every row represents one validation location.
+comes in a wide format, every row represents one validation location.
 The first four columns of the train dataframe are the ID of the Pixel,
 its land cover classification from Fritz et al. (2017), its longitude
 and its latitude. Afterwards, each column contains the measurement for
-one band and for a single day. The test dataframe has the same
+one band on a single day. The test dataframe has the same
 structure, but without the first four columns.
 
 The simplified model uses each day as a single predictor. To generate
-monthly data per band from the train and test dataframe, I created a
+monthly data for each band from the train and test dataframe, I created a
 function that takes the original dataframe. To extract the information
 on date and band from the name of the columns, it first converts the
 dataframe into a longer format with only one column for all reflectance
 values and one column with all former column names. Afterwards, they can
 be read via the {stringr} package and converted into timestamps with
-{lubridate} and numeric information on the band.
+{lubridate}. Also the information on the band can be turned into a numeric value.
 
 From this tidy data structure, annual mean, minimum and maximum values
-can be computed per band. Additionally, monthly means per band can be
+can be computed for each band. Additionally, monthly means per band can be
 calculated. By converting both dataframes back into a wide format and
 joining them, the result is a data format like the original, where each
-row corresponds to one pixel - but with monthly data instead of daily
-and additional annual mean, min and max values.
+row corresponds to one pixel - but with monthly instead of daily data. Additionally, each location now contains information on annual mean, min and max values.
 
-However, to retreive data that the boosted regression tree model can
+However, to retrieve data that the boosted regression tree model can
 process, one additional step is necessary. As parts of the data are
-missing, some of the built in functions (e.g. min()) return warnings as
-they generate NaN and Infinite values. Those have to be converted to NA
+missing, some of the built in functions (e.g. min()) return NaN or Infinite values. Those have to be converted to NA
 values as the last step of data wrangling.
 
 To additionally preserve the information on PixelID and land cover
 classification in the train dataframe, the function takes information on
-whether it is the train or the test data set and performs some
-operations only on the train dataframe.
+whether it is the train or the test data set and keeps these columns in the train dataframe.
 
-```{r data wrangling: change to monthly data}
+```{r data wrangling: change to monthly data, warning = FALSE, message = FALSE}
 
 # change depending on train and test
 get_monthly_predictors <- function(data, test_data=FALSE){
@@ -242,6 +238,8 @@ information on the land cover, it cannot be used for this purpose).
 
 ```{r split data}
 
+set.seed(42) # for reproducibility
+
 # split data along land cover classes
 monthly_split <- train_monthly |>
   dplyr::select(LC1, contains("band")) |>
@@ -254,13 +252,13 @@ test2 <- rsample::testing(monthly_split)
 
 Afterwards, the model structure is specified via the {parsnip} package.
 It provides an interface for the {xboost} package - we use a boosted
-regression / classification tree. In this step, I implement the second
-improvement: tuning additional hyper-parameters. As additional
-parameter, I chose the learn rate, which was not tuned in the original
-implementation. This increases the computation time significantly.
+regression / classification tree. In this step, I implement the second and third
+improvement: tuning additional hyper-parameters and increasing the number of trees. As additional
+hyper-parameter, I chose the learn rate, which was not tuned in the original
+implementation. Both improvements increase the computation time significantly.
 However, as the number of predictors has been reduced extremely (from
-2608 to 105), the computation time is much lower than when applying this
-step to the original model. In theory, it is possible to tune various
+2608 to 105), the computation time is much lower than when applying these
+steps to the original model. In theory, it is possible to tune various
 further parameters for a boosted regression tree (e.g. mtry, the number
 of predictors included per tree). However, to keep the computation time
 for this model low, I will only tune one further parameter in this
@@ -269,6 +267,8 @@ example.
 As a next step, the workflow is defined with the {workflow} package.
 
 ```{r define model & workflow}
+
+set.seed(42)
 
 # specify model structure and model - final model
 model_settings <- parsnip::boost_tree(
@@ -300,8 +300,8 @@ hp_settings <- dials::grid_latin_hypercube(
 Afterwards, the actual model can be calibrated as in *A Handful of
 Pixels*, including a three-fold cross-validation. The best model is
 selected in the end and trained on the data. The tuned hyper-parameters
-for a tree number of 500 are min_n = 35 , tree_depth = 2 and learn_rate
-= 0.02.
+for a tree number of 500 are min_n = 29, tree_depth = 7 and learn_rate
+= 0.015 - however they vary depending on the seeds chosen beforehand.
 
 ```{r model calibration}
 
@@ -348,8 +348,8 @@ print(xgb_best_hp$fit$actions$model$spec)
 ## Model evaluation
 
 To test the performance of the model, we can first predict the land
-cover classes of our test set and than access the accuracy of the
-predictions. This can be visualized with the confusion matrix provided
+cover classes of our new test set and then access the accuracy of the
+predictions. The accuracy can be visualized with the confusion matrix provided
 by the caret package:
 
 ```{r evaluate my own model}
@@ -367,31 +367,31 @@ conf_matrix <- caret::confusionMatrix(
 print(conf_matrix$overall[1:2])
 print(conf_matrix$table)
 
-
 ```
 
 The accuracy of the model from *A Handful of Pixels* is 0.42, the
-accuracy of the final model is 0.47 (the result differs slightly betwen
-the runs). To access the influence of the single improvements on the
-model performance, I also evaluated the model
+accuracy of the final model is 0.47 (the result differs slightly
+depending on the random seeds). To access the influence of the single
+improvements on the model performance, I also evaluated the model
 
-1) with only monthly predictor data (Accuracy: 0.44)
+1)  with only monthly predictor data (Accuracy: 0.46)
 
-2) with additional hyper-parameter tuning (Accuracy: 0.44)
+2)  with additional hyper-parameter tuning (Accuracy: 0.47)
 
-3) with hyper-parameter tuning and an additionally increased number of
-trees (Accuracy: 0.47)
+3)  with hyper-parameter tuning and an additionally increased number of
+    trees (Accuracy: 0.47)
 
-It can be seen that the additional tuning of the learn rate has almost
-no influence on the model performance, while the higher number of trees
-and the monthly predictor data do make a difference. Interesting is
-especially the effect of monthly predictor data. By reducing the number
-of predictors and decreasing the temporal resolution, the model reduces
-its computational time to a fraction of the original time while
-increasing the accuracy by 0.02. This highlights the importance of data
-wrangling and the choice of the right predictors. It also shows that
-choosing daily data as individual predictors might not be the best
-choice when the actual predictor should be an annual cycle.
+It can be seen that the additional tuning of the learn rate and the
+higher number of trees has almost no influence on the model
+performance - however the exact influence varies with the random seeds
+chosen. Interesting is especially the effect of monthly predictor data.
+By reducing the number of predictors and decreasing the temporal
+resolution, the model reduces its computational time to a fraction of
+the original time while increasing the accuracy by 0.04. This highlights
+the importance of data wrangling and the choice of the right predictors.
+It also shows that daily data as individual predictors might
+not be the best choice when the actual predictor should be an annual
+cycle.
 
 # References
 
