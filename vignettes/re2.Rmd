@@ -1,0 +1,647 @@
+---
+title: "Spatial Upscaling"
+author: "Sophie Spelsberg"
+date: "2024-01-08"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 4 Spatial Upscaling of Leaf Nitrogen Content
+
+Here, I will train a random forest model on global leaf nitrogen content
+with data based on Tian et al. (2019). The data was made publicly
+available by GECO, University of Bern (n.d.) on GitHub. The model will
+be trained using three different forms of cross-validation (CV): random
+CV, spatial CV, and environmental CV.
+
+In the following, I will focus on the differences between those three CV
+methods. The choice of the right method during model training is
+important for spatial upscaling: depending on the type of CV, the model
+can be transferred better or worse to locations without measurement data
+(Ludwig et al. 2023).
+
+## 4.1 Ludwig et al.: transferability of global spatial prediction models
+
+Global spatial upscaling is only possible if the value range of the
+predictors in the training data set resembles the *global* value range
+of the predictors. However, the training data is often clustered - i.e.
+concentrated on a few regions - and therefore does not represent global
+environmental conditions well. As the trained models are bad at
+extrapolating, they usually produce erroneous predictions for regions
+where environmental conditions differ from those in the training data
+set. This problem can be tackled by using special forms of
+cross-validation (Ludwig et al. 2023).
+
+### 4.1.1 Random and spatial cross-validation
+
+In their paper, Ludwig et al. (2023) suggest to use spatial
+cross-validation instead of random cross-validation, so that prediction
+models can be better transferred to regions for which there is little or
+no ground validation data. This is because the two CV types divide the
+data into folds based on different methods:
+
+**Random cross-validation:** A random CV is the usual way of
+cross-validating models. The data are split randomly into several (e.g.
+5) folds to create internal training and testing sets. In a 5-fold
+random cross-validation, the model is trained 5 times, omitting a
+different fold each time during training and using it for validation.
+
+**Spatial cross-validation:** The spatial CV follows the same idea - the
+data is split into several folds, which are used as training and
+validation folds. However, the folds are created differently: The data
+points are not randomly assigned to the folds, but according to
+geographical clusters. Individual folds therefore only contain data
+points from certain regions, while data from other regions is completely
+omitted.
+
+Consequently -- if we consider how far the data points in fold 1 are
+(geographically) from those in the other folds -- the distance between
+the folds will be greater for the spatial CV than for the random CV.
+Ludwig et al. assume that the clusters therefore also represent regions
+with differing environmental conditions. The model is thus already
+trained and validated with folds between which the range of the
+predictor values differs significantly. This is not the case for the
+folds of a random cross validation.
+
+As a result, models with random cross validation are more prone to
+overfitting on the regions in which the training data is clustered.
+Therefore, the metrics of a model trained with random CV only show how
+well the model works in regions where the training data is clustered. In
+contrast, models trained with spatial CV can make better predictions for
+combinations in the multivariate predictor space that differ from the
+training data set.
+
+### 4.1.2 Distance between prediction and training location
+
+Ludwig et al. (2023) consider geographical distance between prediction
+and training locations. They argue that different geographical regions
+also represent different environmental conditions. However, this does
+not necessarily have to be the case -- environmental conditions in
+southern Chile can be similar to those in northwestern Europe. In that
+case, leaf nitrogen content in southern Chile could be predicted well by
+a model trained on European data. At the same time, the model will
+generate meaningless predictions for places in Europe whose
+environmental conditions are not covered by the training data set.
+
+A more direct approach would therefore be to consider statistical
+distance in the multivariate predictor space instead of geographical
+distance. This concept will be applied to the random forest model
+training in section 4.2.4 with the implementation of an environmental
+cross-validation: the clusters for the folds are not determined based on
+longitude and latitude (geographical distance) but based on the distance
+in the bivariate predictor space of mean annual temperature and mean
+annual precipitation.
+
+## 4.2 Train a random forest model on leaf nitrogen content
+
+In this section I will train three random forest models with random,
+spatial and environmental CV and compare the model performances across
+CV folds. As predictors for leaf nitrogen content (leafN), I will use
+the elevation above sea level (elv), mean annual temperature (mat), mean
+annual precipitation (map), atmospheric nitrogen deposition (ndep), mean
+annual daily irradiance (mai) and the Species of the plant on which the
+leaf Nitrogen content was measured. The code for the model is based on
+*Spatial Upscaling* by Stocker (2023).
+
+### 4.2.1 Data wrangling
+
+The data used for model training can be downloaded directly via GitHub.
+It contains information on leaf nitrogen content and various climatic
+and atmospheric variables for more than 36.000 measurement points on 6
+continents.
+
+```{r libraries, include=FALSE}
+use_pkgs <-  c("dplyr", "tidyr", "readr", "lubridate", "stringr", "purrr",
+              "ggplot2", "tidyverse", "visdat", "terra", "hexbin", "jsonlite",
+              "MODISTools", "forcats", "yardstick", "recipes", "caret",
+              "broom", "skimr", "cowplot", "scico", "hwsdr", "usethis",
+              "renv", "rsample", "modelr", "rmarkdown", "rpart",
+              "rpart.plot", "ranger", "sessioninfo", "ncdf4", "pdp", "vip",
+              "rnaturalearth", "rnaturalearthdata")
+
+# read all into library
+lapply(use_pkgs, library, character.only=TRUE)
+
+```
+
+```{r read data}
+df <- readr::read_csv("https://raw.githubusercontent.com/stineb/leafnp_data/main/data/leafnp_tian_et_al.csv")
+```
+
+The first step after downloading the data is data wrangling. In this
+case, we select all variables of interest (i.e. the predictor and target
+variables and longitude and latitude of the measurement points). For the
+model, we only use measurement data from the 50 most common species.
+
+```{r tidy data}
+
+# get the 50 most common species from the dataset
+common_species <- df |> 
+  group_by(Species) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count)) |> 
+  dplyr::slice(1:50) |> 
+  pull(Species)
+
+# select all relevant variables for leafN modelling
+dfs <- df |> 
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |> 
+  filter(Species %in% common_species) # only use datapoints from the 50 most common species
+```
+
+However, by doing so, we omit mostly data points from continents with
+few measurements (e.g. all Australian measurements on eucalyptus
+species, as they are not among the most common species in the data set).
+This intensifies the clustering of the training data, as can be seen in
+the map below.
+
+```{r plot omitted datapoints}
+
+# select all species
+dfs_all_species <- df |> 
+  dplyr::select(leafN, lon, lat, elv, mat, map, ndep, mai, Species) |>
+  
+  # new column that specifies whether a datapoint is used for the model training
+  mutate(used_for_model = Species %in% common_species) |>
+  arrange(used_for_model) # order for plotting TRUE on top of FALSE
+
+
+# get coast outline for plot of world map
+coast <- rnaturalearth::ne_coastline(scale = 110, returnclass = "sf")
+
+# create base plot with coastline
+plot_map <- ggplot() +
+  geom_sf(data = coast,
+          colour = 'black',
+          size = 0.2) +
+  coord_sf(ylim = c(-60, 80),   # set extent in longitude and latitude
+           expand = FALSE) +    # to draw map strictly bounded by the specified extent
+  labs(x = "", y = "") +
+  theme(legend.position = "bottom") +
+  theme_classic()
+
+# add datapoints
+plot_map +
+  geom_point(data = dfs_all_species, aes(x = lon, y = lat, color = used_for_model), size = 0.2) +
+  scale_color_manual(values = c("#eda380", "red"),
+                     name = "Included in model", 
+                     labels = c("omitted", "included")) 
+```
+
+### 4.2.2 Random cross-validation
+
+To train a random forest model with random cross-validation, we start by
+defining the formula via the {recipes} package. Additional
+pre-processing (e.g. centering and scaling) is possible, but not
+required for random forest models. Therefore, all three models were
+computed without standardizing the data (which has a negligible effect
+on the metrics of this model).
+
+```{r pre-processing}
+
+# provide the formula for the model
+pp <- recipes::recipe(leafN ~ elv + mat + map + ndep + mai + Species, 
+                      data = dfs)  # |> 
+  # recipes::step_center(recipes::all_numeric(), -recipes::all_outcomes()) |>
+  # recipes::step_scale(recipes::all_numeric(), -recipes::all_outcomes())
+
+```
+
+As the main step, we can then train a random forest model with the
+{caret} package, which uses the {ranger} implementation of a random
+forest. As a first argument, it takes the pre-processing recipe. Only
+two hyperparameters are set manually (mtry = 3 and min.nod.size = 12),
+while the default values are used for all other parameters. The
+performance metrics across the CV folds can then be extracted directly
+from the model object: For the 5-fold cross-validated random forest,
+mean R2 across folds is 0.785 and the mean RMSE is 2.375. Those values
+are very similar for each CV fold.
+
+```{r train random forest model}
+
+# train a model with the ranger implementation of random forest
+leafN_mod <- caret::train(
+  pp, 
+  data = dfs |> drop_na(), 
+  method = "ranger", # use random forest
+  trControl = trainControl(method = "cv", number = 5, savePredictions = "final"),
+  tuneGrid = expand.grid( .mtry = 3, # how many variables per tree
+                          .min.node.size = 12, # min leaf node size
+                          .splitrule = "variance"), # default for regression
+  seed = 42   # for reproducibility
+)
+
+# print results
+# print(leafN_mod)
+print(leafN_mod$resample) # metrics for each fold
+
+```
+
+### 4.2.3 Spatial cross-validation
+
+In order to compute a global map of leaf nitrogen content, it is
+important to assess whether the model created in section 4.2.2 can be
+applied to regions without reference data. For this purpose, it is
+essential to know whether the training data set is clustered, i.e.
+whether most of the data points are concentrated in a few regions, while
+there is almost no data for other regions. As can be seen in Section
+4.2.1 and the map below, the data used for model training is heavily
+clustered: most of the data points are concentrated in Europe and east
+Asia, while almost no measurements from Africa or Australia are
+included.
+
+This clustering has implications for spatial upscaling:
+
+-   When training a model on this data set with random CV, it will be
+    almost exclusively trained on predictor data that represents
+    conditions in Europe (and east Asia). Other regions (e. g. the
+    tropics, very continental or subarctic regions) will have
+    combinations of predictor variables that are not represented in the
+    training data set. For those regions the model will have to
+    extrapolate and thus produce meaningless predictions. The upscaling
+    should therefore be limited to regions with a similar predictor
+    space as the training set - reliable global upscaling will be almost
+    impossible.
+
+-   Model metrics (for random CV) will only contain information on the
+    applicability of the model in the regions with clustered data. Map
+    accuracy should be assessed differently and can't just be assumed to
+    be the same as model accuracy metrics.
+
+```{r plot global distribution}
+
+# plot points included in model training
+plot_map +
+  geom_point(data = dfs, aes(x = lon, y = lat), color = "red", size = 0.2)
+
+```
+
+To address these problems with spatial upscaling, it is possible to use
+a spatial cross-validation instead of a random one. To implement this,
+we can first cluster the data with kmeans based on latitude and
+longitude. The random seed chosen below results in three clusters in
+Europe, one in North and South America and one in Central and East Asia,
+including the two points in Australia. However, these clusters can vary
+greatly depending on the random seed.
+
+```{r kmeans clustering}
+
+# cluster the data based on longitude and latitude
+set.seed(100)
+clusters <- kmeans(
+  dfs |> dplyr::select(lon,lat),
+  centers = 5) 
+
+# add the cluster information to the original dataframe
+dfs$cluster <- factor(clusters$cluster)
+
+# plot map with information on cluster
+plot_map +
+  geom_point(data = dfs, aes(x = lon, y = lat, color = cluster), size = 0.2) +
+  scale_color_brewer(palette = "Set1")
+
+```
+
+The number of data points included in each cluster ranges from 139 to
+11868. The distribution of leaf nitrogen varies slightly across those
+clusters (it should be more similar for all folds of the random CV).
+This can be interpreted as a consequence of the different environmental
+conditions between the clusters. Among those conditions is the
+composition of species, which differs substantially between the
+clusters: cluster 3 (Scandinavia) and 5 (Americas) contain only 7
+species, while cluster 4 (western Europe) includes 26.
+
+```{r distribution of leafN per cluster}
+
+# get info on number of data points and mean per cluster
+text_df <- dfs |>
+  group_by(cluster) |>
+  summarise(n = n(),
+            mean_leafN = mean(leafN), 
+            n_species = length(unique(Species))) # number of species in cluster
+
+# plot density for each cluster
+ggplot(data = dfs, aes(x = leafN, color=cluster)) +
+  geom_density() +
+  facet_wrap(~cluster) + 
+  
+  # add info on n and mean from df above
+  geom_text(data = text_df,  
+            mapping = aes(x = 40, 
+                          y = 0.2, 
+                          label = paste0("n: ", n)
+                          )) +
+  geom_text(data = text_df,
+            mapping = aes(x = 40, 
+                          y = 0.17, 
+                          label = paste0("mean: ", round(mean_leafN, 2))
+                          )) +
+  geom_text(data = text_df,  
+            mapping = aes(x = 40, 
+                          y = 0.14, 
+                          label = paste0("n Species: ", n_species)
+                          )) +
+  scale_color_brewer(palette = "Set1") +
+  labs(y = "Density") +
+  theme_classic() 
+
+
+```
+
+In the next step, we can build folds based on the clusters. To do so, we
+can extract the indices of the training and validation part of our 5
+spatial folds and save them as a list:
+
+```{r spatial cross validation: clustered folds}
+
+# create folds based on clusters
+group_folds_train <- purrr::map(
+  seq(length(unique(dfs$cluster))),
+  ~ {
+    dfs |> 
+      select(cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(cluster != .) |> 
+      pull(idx)
+  }
+)
+
+group_folds_test <- purrr::map(
+  seq(length(unique(dfs$cluster))),
+  ~ {
+    dfs |> 
+      select(cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(cluster == .) |> 
+      pull(idx)
+  }
+)
+
+```
+
+The folds can then be used to implement a 5-fold spatial
+cross-validation. The metrics for each fold are computed in the function
+*train_test_by_fold,* which fits a model on 4 folds and validates it on
+the fifth. This implementation uses unscaled predictor data. However, an
+alternative function *train_test_by_fold_scaled* can be loaded via the
+source() function. The scaling is implemented separately for each fold
+within the function to avoid data leakage between the folds. The code to
+extract the evaluation metrics is adapted from Chapter 9 of the book
+*Applied Geodata Science* (Stocker et al. 2023). The RMSE and R2 values
+for each fold of the model trained on unscaled predictor data can be
+found in the table below.
+
+```{r spatial cross validation}
+
+# alternative to the function below
+# scales predictors before model training
+source("../R/train_test_by_fold_scaled.R")
+
+# trains a random forest model on a given set of rows and predicts on a disjunct set of rows
+# predictors: array of predictor column names
+train_test_by_fold <- function(df, 
+                               idx_train, 
+                               idx_val, 
+                               predictors = c("elv", "mat", "map", "ndep", "mai", "Species")
+                               ){
+    
+  # build a model on the spatial train folds
+  mod <- ranger::ranger(
+    x =  df[idx_train, predictors],  # dataframe, columns are predictors
+    y =  df[idx_train,]$leafN,       # a vector of the target leafN values
+    
+    # use same hyperparameters as above
+    mtry = 3,
+    min.node.size = 12,
+    splitrule = "variance", # default
+    seed = 42) 
+  
+  # df with only validation data
+  val_fold <- df[idx_val,]
+  
+  # add predictions to the train fold
+  val_fold$fitted <- predict(mod,                          # fitted model object 
+                             data = val_fold[, predictors] # predictor df (validation)
+                             )$predictions                 # extract predicted values
+
+  # get evaluation metrics for validation set
+  metrics <- val_fold |>
+    yardstick::metrics(leafN, fitted)
+  
+  # extract r squared and rmse from metrics table             
+  rsq <- metrics |> 
+    filter(.metric == "rsq") |>
+    pull(.estimate)
+  rmse <- metrics |> 
+    filter(.metric == "rmse") |>
+    pull(.estimate)
+  
+  return(tibble(rsq = rsq, rmse = rmse))
+}
+
+
+# spatial CV model metrics for unscaled predictor data
+out <- purrr::map2_dfr(group_folds_train,
+                       group_folds_test,
+                       ~train_test_by_fold(dfs, .x, .y)
+                       ) |> 
+  mutate(test_fold = 1:5)
+
+print(out)
+```
+
+The mean model metrics for a spatial CV (mean R2: 0.32; mean RMSE: 4.15)
+are much worse than for a random CV (mean R2: 0.78; mean RMSE: 2.38).
+However, they display different properties of the models: As the
+training data is highly clustered, the random CV metrics only indicate
+how well the model predictions are *within* the clusters. The spatial CV
+metrics rather show how good the model predicts new points *outside* the
+clusters.
+
+Also, while the metrics are very similar across folds for the model
+trained with random CV, they vary extremely for the spatial CV model (R2
+between 0.03 for Asia and 0.58 for western Europe). The metrics for the
+European folds (1,4,5, especially the two central and western European
+folds) are much better than for the American and Asian fold. This has a
+simple reason: the European folds can be considered similar in terms of
+environmental conditions. Thus, when one of the European folds is the
+validation fold, there are folds with similar predictors in the training
+set. For validation with the Asian cluster, on the other hand, the model
+has to extrapolate. Most of the Asian species are unique, only 5.66 % of
+the measurements in the Asian cluster are from species which also appear
+in the other clusters (see below). Consequently, the model has to handle
+unknown values for this predictor. This will result in meaningless
+predictions and bad model performance. For the random CV this is not the
+case: each fold contains very similar data due to the random split,
+resulting in similar model metrics for each fold.
+
+```{r comparison of species}
+
+# vector of species in asian cluster
+species_asia <- unique(
+  dfs |>
+  filter(cluster == 2) |>
+  select(Species)
+  )$Species
+
+# vector of species in rest of the world
+species_rest <- unique(
+  dfs |>
+  filter(cluster != 2) |>
+  select(Species)
+  )$Species
+
+# get mutual species
+species_mutual <- species_asia[species_asia %in% species_rest]
+
+# how many of the asian datapoints are those species?
+n_species_mutual_asia <- nrow(
+  dfs |>
+  filter(cluster == 2) |> # 1448
+  filter(Species %in% species_mutual)
+  )
+
+# percentage of the measurements with species that appear in other clusters
+percentage_mutual_asia <- round((n_species_mutual_asia / text_df$n[2] * 100), 2)
+
+# Results
+paste("There are", 
+      length(species_mutual), 
+      "mutual species between the Asian cluster and the other clusters:", 
+      paste(species_mutual, collapse = ", "), 
+      ".")
+
+paste("Only", 
+      percentage_mutual_asia, 
+      "% of the Asian measurements were from species that also appear in other clusters."
+      )
+
+```
+
+### 4.2.4 Environmental cross-validation
+
+As an alternative to the spatial cross-validation, it is also possible
+to build clusters based on environmental variables. In this case, mean
+annual temperature and mean annual precipitation were the variables used
+for clustering. Both variables were scaled beforehand to guarantee that
+both were given the same weight in the clustering process. Then, as for
+the clusters based on geographical position, kmeans was used to build
+the clusters.
+
+```{r environmental clustering, include=FALSE}
+
+# add columns with scaled temp and precip to the dataframe
+set.seed(100)
+dfs <- dfs |> 
+  mutate(scaled_temp = scale(mat),
+         scaled_precip = scale(map))
+
+# cluster the data based on scaled mean annual temperature and precipitation
+env_clusters <- kmeans(
+  dfs |> dplyr::select(scaled_temp,scaled_precip),
+  centers = 5)
+
+# add the cluster information to the original dataframe
+dfs$env_cluster <- factor(env_clusters$cluster)
+```
+
+As a result, we retrieve five clusters which can be interpreted as zones
+of similar climate rather than geographical regions, as can be seen in
+the map below.
+
+```{r environmental cluster map}
+# plot map with information on environmental clusters
+plot_map +
+  geom_point(data = dfs, aes(x = lon, y = lat, color = env_cluster), size = 0.2)  +
+  scale_color_brewer(palette = "Accent")
+
+```
+
+After the clustering, the environmental clusters were handled the same
+way as the geographical clusters: the clusters were treated as the five
+folds of a cross-validation. Then the model was trained and R2 and RMSE
+were extracted with the same function as before. They can be found in
+the table below.
+
+```{r create environmental folds, include=FALSE}
+
+# create folds based on clusters
+# assuming 'df' contains the data and a column called 'cluster' containing the 
+# result of the k-means clustering
+env_folds_train <- purrr::map(
+  seq(length(unique(dfs$env_cluster))),
+  ~ {
+    dfs |> 
+      select(env_cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(env_cluster != .) |> 
+      pull(idx)
+  }
+)
+
+env_folds_test <- purrr::map(
+  seq(length(unique(dfs$env_cluster))),
+  ~ {
+    dfs |> 
+      select(env_cluster) |> 
+      mutate(idx = 1:n()) |> 
+      filter(env_cluster == .) |> 
+      pull(idx)
+  }
+)
+
+```
+
+```{r environmental cross validation}
+
+# perform 5 fold environmental CV and collect model metrics in dataframe
+env_out <- purrr::map2_dfr(env_folds_train,
+                           env_folds_test,
+                           ~train_test_by_fold(dfs, .x, .y)
+                           ) |> 
+  mutate(test_fold = 1:5)
+
+print(env_out)
+
+```
+
+The metrics (mean R2: 0.47; mean RMSE: 3.73) are also worse than for the
+random CV, due to the same reason as before - the metrics indicate how
+well the model is applicable to new rather than known conditions.
+However, they are better and more similar between the folds than for the
+spatial CV.
+
+This might indicate that the folds are more similar in environmental
+conditions than the geographic folds. To answer this, it would be
+necessary to compare the distribution of predictors between folds. It
+also shows that environmental CV can be a good alternative to spatial CV
+to some extent. Like the spatial CV, it shows how well the model can be
+transferred to conditions outside the training data, but it has better
+model metrics. To be able to assess this, however, it is necessary to
+compare the predictor spaces between the individual folds of the random
+and spatial CV.
+
+## References
+
+Ludwig, M. et al. 2023. Assessing and improving the transferability of
+current global spatial prediction models. Global Ecology and
+Biogeography, 32, 356-368. [doi.org/10.1111/geb.13635](#0)
+
+Stocker, B. et al. 2023. Applied Geodata Science (v1.0). Zenodo.
+[doi.org/10.5281/zenodo.7740560](https://doi.org/10.5281/zenodo.7740560)
+
+Stocker, B. 2023. Spatial Upscaling.
+[geco-bern.github.io/spatial_upscaling/](https://geco-bern.github.io/spatial_upscaling/){.uri}
+
+Stocker, B. n.d. leafnp_data. GitHub.
+[github.com/stineb/leafnp_data](https://github.com/stineb/leafnp_data){.uri}
+
+Tian, D. et al. 2019. A global database of paired leaf nitrogen and
+phosphorus concentrations of terrestrial plants. Ecology, 100, 9,
+e02812. [doi.org/10.1002/ecy.2812](https://doi.org/10.1002/ecy.2812)

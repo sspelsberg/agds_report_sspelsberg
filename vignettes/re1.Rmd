@@ -1,0 +1,408 @@
+---
+title: "LULC"
+author: "Sophie Spelsberg"
+date: "2024-01-08"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Land Cover Classification
+
+Here, I will train a machine learning algorithm to model land cover
+classes from MODIS data, based on the land cover classification model
+implemented by Hufken (2023) in *A Handful of Pixels*. As training and
+test data set, we will use the data sets provided there. Original
+validation data stems from Fritz et al. (2017) and can be downloaded via
+Zenodo. As predictor data we use MODIS data from the MCD43A4 data
+product (bands 1-7). This can be downloaded with the NASA AppEEARS API
+via the {appears} package.
+
+There are various options to improve the model performance in comparison
+to the original model. The implementation in *A Handful of Pixels* is a
+simplified version of the official MODIS land use and land cover (LULC)
+product (MCD12Q1 LULC), which shows a much better model performance than
+the simplified version (Friedl et al. 2010). Therefore, some
+improvements can be derived from their implementation of the model.
+
+1)  **tune more hyper-parameters:** this can increase the model
+    performance significantly, but comes at higher computational costs.
+2)  **increase the number of trees:** can also lead to a better model
+    performance, also at higher computational costs.
+3)  **use monthly means for the predictor variables and include annual
+    mean, minimum and maximum values in the predictor set**: this seems
+    counterintuitive, as it decreases the temporal resolution of the
+    MCD43A4 data. However, it might represent the seasonal changes in
+    the data better than using daily values as individual predictors.
+    The annual minimum, maximum and mean values also add information
+    about the annual course of the data that is not reflected in the
+    daily data set. These parameters are also used by Friedl et al.
+    (2010). Moreover, these changes reduce the computation time, which
+    allows the rest of the model to be more complex.
+4)  **add surface temperature as a predictor**: temperature has a strong
+    influence on land cover - in alpine regions it determines the
+    boundary between forest, shrubs and grassland, and is a crucial
+    factor whether an area is suitable for agricultural use. Therefore,
+    it makes sense to include additional temperature variables as
+    predictors (e.g. min, max, mean temperature, monthly means) like the
+    official MODIS LULC product does.
+5)  **increase the number of validation sites**: a good spatial
+    distribution and high number of training data points can increase
+    the model performance. Also, as our model is only applied to
+    Switzerland, it might make sense to restrict the validation data to
+    Switzerland and surrounding areas.
+6)  **validate the results over multiple years**: Friedl et al. (2010)
+    use this technique to control if the classification of a pixel
+    changed between two years without actual changes in land cover. This
+    helps to identify classification errors.
+
+In the following, I will implement the first three ideas: I will tune
+more hyper-parameters, increase the number of trees and I will use
+monthly instead of daily predictor data and include annual mean, minimum
+and maximum values. Thus, I will add parts to the model training
+workflow as well as an additional step to the data wrangling.
+
+```{r libraries, include = FALSE}
+use_pkgs <-  c("dplyr", "tidyr", "readr", "lubridate", "stringr", "purrr",
+              "ggplot2", "tidyverse", "visdat", "terra", "hexbin", "jsonlite",
+              "MODISTools", "forcats", "yardstick", "recipes", "caret",
+              "broom", "skimr", "cowplot", "scico", "hwsdr", "usethis",
+              "renv", "modelr", "rmarkdown", "rpart", "RColorBrewer",
+              "rpart.plot", "ranger", "sessioninfo", "skimr", "ncdf4", "pdp", 
+              "vip")
+
+# read all into library
+lapply(use_pkgs, library, character.only=TRUE)
+
+# important for this model:
+library(parsnip) # tidy machine learning
+library(workflows) # manage workflows
+library(rsample) # split into folds
+library(tune)
+library(dials) # (hyper) parameter sampling schemes
+library(xgboost) # for boosted regression tree
+```
+
+## Data wrangling
+
+After loading the data sets provided in *A Handful of Pixels,* we can
+begin with the data wrangling. In this case, we want to change the
+predictor data from daily to monthly data to represent the annual cycle
+better.
+
+```{r load train and test data}
+# wide format 
+# cols: pixelID, LC1, lat, lon, bands at given dates
+train <- readRDS("../data/training_data.rds")
+test <- readRDS("../data/test_data.rds")
+```
+
+To do so, it is important to understand the structure of the data. It
+comes in a wide format, so every row represents one validation location.
+The first four columns of the train dataframe are the ID of the Pixel,
+its land cover classification from Fritz et al. (2017), its longitude
+and its latitude. Afterwards, each column contains the measurement for
+one band and for a single day. The test dataframe has the same
+structure, but without the first four columns.
+
+The simplified model uses each day as a single predictor. To generate
+monthly data per band from the train and test dataframe, I created a
+function that takes the original dataframe. To extract the information
+on date and band from the name of the columns, it first converts the
+dataframe into a longer format with only one column for all reflectance
+values and one column with all former column names. Afterwards, they can
+be read via the {stringr} package and converted into timestamps with
+{lubridate} and numeric information on the band.
+
+From this tidy data structure, annual mean, minimum and maximum values
+can be computed per band. Additionally, monthly means per band can be
+calculated. By converting both dataframes back into a wide format and
+joining them, the result is a data format like the original, where each
+row corresponds to one pixel - but with monthly data instead of daily
+and additional annual mean, min and max values.
+
+However, to retreive data that the boosted regression tree model can
+process, one additional step is necessary. As parts of the data are
+missing, some of the built in functions (e.g. min()) return warnings as
+they generate NaN and Infinite values. Those have to be converted to NA
+values as the last step of data wrangling.
+
+To additionally preserve the information on PixelID and land cover
+classification in the train dataframe, the function takes information on
+whether it is the train or the test data set and performs some
+operations only on the train dataframe.
+
+```{r data wrangling: change to monthly data}
+
+# change depending on train and test
+get_monthly_predictors <- function(data, test_data=FALSE){
+  
+  data <- data[,1:2566] |>  # cut after reflection bands
+    mutate(own_ID = c(1:nrow(data))) |>  # add ID to reorder the df in the end
+    
+    # convert to a longer format (only one column with reflectance values)
+    tidyr::pivot_longer(
+      cols = starts_with("MCD43A4_061_Nadir_Reflectance"),
+      names_to = "band_date",
+      values_to = "val"
+      ) |>
+    
+    # get date and band information from band_date string
+    # turn last 10 characters into datetime object
+    mutate(date = lubridate::ymd(stringr::str_sub(band_date, -10)),
+           month = lubridate::month(date),
+           band = as.numeric(stringr::str_sub(band_date, -12, -12))
+           )
+
+  data_annual <- data |>
+    
+    # compute annual mean, min and max values
+    group_by(own_ID, band) |>
+    summarise(
+      mean = mean(val, na.rm=TRUE),
+      min = min(val, na.rm=TRUE),
+      max = max(val, na.rm=TRUE)
+      ) |>
+    ungroup() |>
+    
+    # change format
+    tidyr::pivot_longer(
+      cols = c(mean, min, max),
+      names_to = "type",
+      values_to = "val"
+      ) |> 
+    mutate(name = paste0("band", band, "_", type)) |>
+    dplyr::select(!c(band, type)) |>
+    tidyr::pivot_wider(
+      names_from = name,
+      values_from = val
+      )
+  
+  # preserve information on PixelID and LC1 in the train data
+  if (test_data) {
+    
+      data <- data |> 
+    
+        # compute monthly means
+        group_by(own_ID, band, month) |>
+        summarise(
+          mean = mean(val, na.rm=TRUE)
+          )    
+    
+  } else {
+    
+      data <- data |> 
+    
+        # compute monthly means
+        group_by(own_ID, band, month) |>
+        summarise(
+          LC1 = mean(LC1),               # additional column for train
+          pixelID = mean(pixelID),       # additional column for train
+          mean = mean(val, na.rm=TRUE)
+          )
+  }  
+
+  data <- data |>
+    ungroup() |>
+    mutate(band_date = paste0("band", band, "_month", month)) |>
+    dplyr::select(!c(band,month)) |> # drop band, month column
+    
+    # turn into wider format
+    tidyr::pivot_wider(
+      values_from = mean,
+      names_from = band_date
+      ) 
+  
+  # add monthly and annual data and turn NaN and Inf to NA
+  data <- left_join(data, data_annual) |>
+    mutate_all(
+      ~ifelse(
+        (is.nan(.) | is.infinite(.)), 
+        NA, 
+        .)
+      )
+  
+  return(data)
+}
+
+
+# convert train and test set into new format
+train_monthly <- get_monthly_predictors(train) 
+test_monthly <- get_monthly_predictors(test, test_data=TRUE)
+
+```
+
+## Model training
+
+To train the model in the next step, it is necessary to first split the
+data in an independent train and test set to evaluate the model
+performance later on (as the provided test set does not contain
+information on the land cover, it cannot be used for this purpose).
+
+```{r split data}
+
+# split data along land cover classes
+monthly_split <- train_monthly |>
+  dplyr::select(LC1, contains("band")) |>
+  rsample::initial_split(strata = LC1, prop = 0.8)
+
+# select training and testing data
+train2 <- rsample::training(monthly_split)
+test2 <- rsample::testing(monthly_split)
+```
+
+Afterwards, the model structure is specified via the {parsnip} package.
+It provides an interface for the {xboost} package - we use a boosted
+regression / classification tree. In this step, I implement the second
+improvement: tuning additional hyper-parameters. As additional
+parameter, I chose the learn rate, which was not tuned in the original
+implementation. This increases the computation time significantly.
+However, as the number of predictors has been reduced extremely (from
+2608 to 105), the computation time is much lower than when applying this
+step to the original model. In theory, it is possible to tune various
+further parameters for a boosted regression tree (e.g. mtry, the number
+of predictors included per tree). However, to keep the computation time
+for this model low, I will only tune one further parameter in this
+example.
+
+As a next step, the workflow is defined with the {workflow} package.
+
+```{r define model & workflow}
+
+# specify model structure and model - final model
+model_settings <- parsnip::boost_tree(
+  trees = 500, 
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune() # additionally tuned
+  ) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+# create workflow compatible with {tune} package
+xgb_workflow <- workflows::workflow() |>
+  add_formula(as.factor(LC1) ~ .) |>
+  add_model(model_settings)
+```
+
+Then, additional settings are made for tuning the hyper-parameters:
+
+```{r hyperparameter settings}
+
+# use dials package for hyper parameter settings
+hp_settings <- dials::grid_latin_hypercube(
+  tune::extract_parameter_set_dials(xgb_workflow),
+  size = 3
+  )
+```
+
+Afterwards, the actual model can be calibrated as in *A Handful of
+Pixels*, including a three-fold cross-validation. The best model is
+selected in the end and trained on the data. The tuned hyper-parameters
+for a tree number of 500 are min_n = 35 , tree_depth = 2 and learn_rate
+= 0.02.
+
+```{r model calibration}
+
+set.seed(3) # for reproducibility
+
+# create folds (divide into different cross-validation training datasets)
+folds <- rsample::vfold_cv(train2, v = 3)
+
+# optimize the model (hyper) parameters and use:
+# 1. the workflow (i.e. model)
+# 2. the cross-validation across training data
+# 3. the (hyper) parameter specifications
+# all data are saved for evaluation
+xgb_results <- tune::tune_grid(
+  xgb_workflow,
+  resamples = folds,
+  grid = hp_settings,
+  control = tune::control_grid(save_pred = TRUE)
+)
+
+# select the best model based upon RMSE
+xgb_best <- tune::select_best(
+  xgb_results,
+  metric = "roc_auc"
+  )
+
+# cook up a model using finalize_workflow
+# which takes workflow (model) specifications
+# and combines it with optimal model
+# parameters into a model workflow
+xgb_best_hp <- tune::finalize_workflow(
+  xgb_workflow,
+  xgb_best
+)
+
+# train a final model with tuned hyper-parameters
+xgb_best_model <- fit(xgb_best_hp, train2)
+
+# print fitted hyper-parameters
+print(xgb_best_hp$fit$actions$model$spec)
+
+```
+
+## Model evaluation
+
+To test the performance of the model, we can first predict the land
+cover classes of our test set and than access the accuracy of the
+predictions. This can be visualized with the confusion matrix provided
+by the caret package:
+
+```{r evaluate my own model}
+
+# run the model on the test2 split
+test_results <- predict(xgb_best_model, test2)
+
+# overview of metrics for model evaluation
+conf_matrix <- caret::confusionMatrix(
+  reference = as.factor(test2$LC1),
+  data = as.factor(test_results$.pred_class)
+  )
+
+# results
+print(conf_matrix$overall[1:2])
+print(conf_matrix$table)
+
+
+```
+
+The accuracy of the model from *A Handful of Pixels* is 0.42, the
+accuracy of the final model is 0.47 (the result differs slightly betwen
+the runs). To access the influence of the single improvements on the
+model performance, I also evaluated the model
+
+1) with only monthly predictor data (Accuracy: 0.44)
+
+2) with additional hyper-parameter tuning (Accuracy: 0.44)
+
+3) with hyper-parameter tuning and an additionally increased number of
+trees (Accuracy: 0.47)
+
+It can be seen that the additional tuning of the learn rate has almost
+no influence on the model performance, while the higher number of trees
+and the monthly predictor data do make a difference. Interesting is
+especially the effect of monthly predictor data. By reducing the number
+of predictors and decreasing the temporal resolution, the model reduces
+its computational time to a fraction of the original time while
+increasing the accuracy by 0.02. This highlights the importance of data
+wrangling and the choice of the right predictors. It also shows that
+choosing daily data as individual predictors might not be the best
+choice when the actual predictor should be an annual cycle.
+
+# References
+
+Friedl, M. et al. 2010. MODIS Collection 5 global land cover: Algorithm
+refinements and characterization of new datasets. Remote Sensing of
+Environment, 114, 1, 168-182.
+[doi.org/10.1016/j.rse.2009.08.016](https://doi.org/10.1016/j.rse.2009.08.016 "Persistent link using digital object identifier")
+
+Fritz, S. et al. 2017. A global dataset of crowdsourced land cover and
+land use reference data. Scientific Data, 4, 170075.
+[doi.org/10.1038/sdata.2017.75](https://doi.org/10.1038/sdata.2017.75)
+
+Hufkens, K. 2023. A Handful of Pixels.
+<https://geco-bern.github.io/handfull_of_pixels/>
